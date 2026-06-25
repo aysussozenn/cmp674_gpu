@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -831,46 +832,100 @@ int main() {
   check_cuda(cudaMalloc(&d_pubkeys, pubkey_bytes), "cudaMalloc(d_pubkeys)");
   check_cuda(cudaMalloc(&d_results, result_bytes), "cudaMalloc(d_results)");
 
+  constexpr int BATCH_SIZE = 65536;
+  constexpr int NUM_STREAMS = 3;
+  cudaStream_t streams[NUM_STREAMS];
+  for (int i = 0; i < NUM_STREAMS; i++) {
+    check_cuda(cudaStreamCreate(&streams[i]), "cudaStreamCreate");
+  }
+
   cudaEvent_t kernel_start, kernel_end, h2d_start, h2d_end, d2h_start, d2h_end;
+  cudaEvent_t stream_kernel_starts[NUM_STREAMS], stream_kernel_ends[NUM_STREAMS];
   check_cuda(cudaEventCreate(&kernel_start), "cudaEventCreate(kernel_start)");
   check_cuda(cudaEventCreate(&kernel_end), "cudaEventCreate(kernel_end)");
   check_cuda(cudaEventCreate(&h2d_start), "cudaEventCreate(h2d_start)");
   check_cuda(cudaEventCreate(&h2d_end), "cudaEventCreate(h2d_end)");
   check_cuda(cudaEventCreate(&d2h_start), "cudaEventCreate(d2h_start)");
   check_cuda(cudaEventCreate(&d2h_end), "cudaEventCreate(d2h_end)");
+  for (int i = 0; i < NUM_STREAMS; i++) {
+    check_cuda(cudaEventCreate(&stream_kernel_starts[i]), "cudaEventCreate(stream_kernel_starts[i])");
+    check_cuda(cudaEventCreate(&stream_kernel_ends[i]), "cudaEventCreate(stream_kernel_ends[i])");
+  }
 
   const auto gpu_total_start = std::chrono::high_resolution_clock::now();
   check_cuda(cudaEventRecord(h2d_start), "cudaEventRecord(h2d_start)");
-  check_cuda(cudaMemcpy(d_packets, h_packets.data(), packet_bytes, cudaMemcpyHostToDevice), "cudaMemcpy packets H2D");
-  check_cuda(cudaMemcpy(d_pubkeys, signer_pub.data(), pubkey_bytes, cudaMemcpyHostToDevice), "cudaMemcpy pubkeys H2D");
-  check_cuda(cudaEventRecord(h2d_end), "cudaEventRecord(h2d_end)");
+  check_cuda(cudaMemcpyAsync(d_pubkeys, signer_pub.data(), pubkey_bytes, cudaMemcpyHostToDevice, streams[0]),
+             "cudaMemcpyAsync pubkeys H2D");
 
-  const int blocks = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-  verify_kernel<<<blocks, THREADS_PER_BLOCK>>>(d_packets, d_pubkeys, Ppub1, Ppub2, P, d_results, N);
-  check_cuda(cudaGetLastError(), "verify_kernel warmup launch");
-  check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize warmup");
+  constexpr int PROFILE_BATCHES[] = {0};
+  constexpr int NUM_PROFILE_BATCHES = sizeof(PROFILE_BATCHES) / sizeof(PROFILE_BATCHES[0]);
+  float profile_times_ms[NUM_PROFILE_BATCHES] = {0.0f};
 
-  check_cuda(cudaEventRecord(kernel_start), "cudaEventRecord(kernel_start)");
-  for (int run = 0; run < GPU_PROFILE_RUNS; run++) {
-    verify_kernel<<<blocks, THREADS_PER_BLOCK>>>(d_packets, d_pubkeys, Ppub1, Ppub2, P, d_results, N);
+  int batch_idx = 0;
+  for (int batch_start = 0; batch_start < N; batch_start += BATCH_SIZE, batch_idx++) {
+    const int batch_end = (batch_start + BATCH_SIZE < N) ? (batch_start + BATCH_SIZE) : N;
+    const int batch_size = batch_end - batch_start;
+    const int batch_blocks = (batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    const int stream_idx = batch_idx % NUM_STREAMS;
+    cudaStream_t current_stream = streams[stream_idx];
+
+    check_cuda(cudaMemcpyAsync(d_packets + batch_start, h_packets.data() + batch_start, sizeof(ADSB_Packet) * batch_size,
+                               cudaMemcpyHostToDevice, current_stream),
+               "cudaMemcpyAsync packets H2D");
+
+    verify_kernel<<<batch_blocks, THREADS_PER_BLOCK, 0, current_stream>>>(
+        d_packets + batch_start, d_pubkeys, Ppub1, Ppub2, P, d_results + batch_start, batch_size);
+    check_cuda(cudaGetLastError(), "verify_kernel warmup launch");
+
+    bool is_profile_batch = false;
+    for (int i = 0; i < NUM_PROFILE_BATCHES; i++) {
+      if (batch_idx == PROFILE_BATCHES[i]) {
+        is_profile_batch = true;
+        break;
+      }
+    }
+    if (is_profile_batch) {
+      check_cuda(cudaEventRecord(stream_kernel_starts[stream_idx], current_stream), "cudaEventRecord(kernel_start)");
+      for (int run = 0; run < GPU_PROFILE_RUNS; run++) {
+        verify_kernel<<<batch_blocks, THREADS_PER_BLOCK, 0, current_stream>>>(
+            d_packets + batch_start, d_pubkeys, Ppub1, Ppub2, P, d_results + batch_start, batch_size);
+      }
+      check_cuda(cudaEventRecord(stream_kernel_ends[stream_idx], current_stream), "cudaEventRecord(kernel_end)");
+      check_cuda(cudaGetLastError(), "verify_kernel profile launch");
+    }
+
+    verify_kernel<<<batch_blocks, THREADS_PER_BLOCK, 0, current_stream>>>(
+        d_packets + batch_start, d_pubkeys, Ppub1, Ppub2, P, d_results + batch_start, batch_size);
+    check_cuda(cudaGetLastError(), "verify_kernel final launch");
+
+    check_cuda(cudaMemcpyAsync(h_gpu_results.data() + batch_start, d_results + batch_start, sizeof(int) * batch_size,
+                               cudaMemcpyDeviceToHost, current_stream),
+               "cudaMemcpyAsync results D2H");
   }
-  verify_kernel<<<blocks, THREADS_PER_BLOCK>>>(d_packets, d_pubkeys, Ppub1, Ppub2, P, d_results, N);
-  check_cuda(cudaEventRecord(kernel_end), "cudaEventRecord(kernel_end)");
-  check_cuda(cudaGetLastError(), "verify_kernel launch");
-  check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
 
+  check_cuda(cudaEventRecord(h2d_end), "cudaEventRecord(h2d_end)");
   check_cuda(cudaEventRecord(d2h_start), "cudaEventRecord(d2h_start)");
-  check_cuda(cudaMemcpy(h_gpu_results.data(), d_results, result_bytes, cudaMemcpyDeviceToHost), "cudaMemcpy results D2H");
+  for (int i = 0; i < NUM_STREAMS; i++) {
+    check_cuda(cudaStreamSynchronize(streams[i]), "cudaStreamSynchronize");
+  }
   check_cuda(cudaEventRecord(d2h_end), "cudaEventRecord(d2h_end)");
   check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize post D2H");
   const auto gpu_total_end = std::chrono::high_resolution_clock::now();
 
   float gpu_kernel_ms = 0.0f, gpu_h2d_ms = 0.0f, gpu_d2h_ms = 0.0f;
-  check_cuda(cudaEventElapsedTime(&gpu_kernel_ms, kernel_start, kernel_end), "cudaEventElapsedTime");
+  for (int i = 0; i < NUM_PROFILE_BATCHES; i++) {
+    float elapsed = 0.0f;
+    check_cuda(cudaEventElapsedTime(&elapsed, stream_kernel_starts[PROFILE_BATCHES[i] % NUM_STREAMS],
+                                    stream_kernel_ends[PROFILE_BATCHES[i] % NUM_STREAMS]),
+               "cudaEventElapsedTime profile");
+    profile_times_ms[i] = elapsed;
+  }
+  std::sort(profile_times_ms, profile_times_ms + NUM_PROFILE_BATCHES);
+  gpu_kernel_ms = profile_times_ms[NUM_PROFILE_BATCHES / 2];
   check_cuda(cudaEventElapsedTime(&gpu_h2d_ms, h2d_start, h2d_end), "cudaEventElapsedTime h2d");
   check_cuda(cudaEventElapsedTime(&gpu_d2h_ms, d2h_start, d2h_end), "cudaEventElapsedTime d2h");
   const auto gpu_total_ms = std::chrono::duration<double, std::milli>(gpu_total_end - gpu_total_start).count();
-  const double gpu_kernel_avg_ms = static_cast<double>(gpu_kernel_ms) / static_cast<double>(GPU_PROFILE_RUNS + 1);
+  const double gpu_kernel_avg_ms = static_cast<double>(gpu_kernel_ms) / static_cast<double>(GPU_PROFILE_RUNS);
 
   int valid_count = 0;
   for (int i = 0; i < N; i++) valid_count += h_gpu_results[i];
@@ -894,7 +949,7 @@ int main() {
   std::cout << "Sign time (ms): " << sign_ms << '\n';
   std::cout << "CPU verify time (ms): " << cpu_ms << '\n';
   std::cout << "GPU H2D time (ms): " << gpu_h2d_ms << '\n';
-  std::cout << "GPU kernel total time over " << (GPU_PROFILE_RUNS + 1) << " runs (ms): " << gpu_kernel_ms << '\n';
+  std::cout << "GPU kernel total time over " << GPU_PROFILE_RUNS << " runs (ms): " << gpu_kernel_ms << '\n';
   std::cout << "GPU kernel avg time (ms): " << gpu_kernel_avg_ms << '\n';
   std::cout << "GPU D2H time (ms): " << gpu_d2h_ms << '\n';
   std::cout << "GPU end-to-end time (ms): " << gpu_total_ms << '\n';
@@ -911,12 +966,19 @@ int main() {
   for (int i = 0; i < 8; i++) std::cout << h_gpu_results[i] << ' ';
   std::cout << '\n';
 
+  for (int i = 0; i < NUM_STREAMS; i++) {
+    cudaStreamDestroy(streams[i]);
+  }
   cudaEventDestroy(kernel_start);
   cudaEventDestroy(kernel_end);
   cudaEventDestroy(h2d_start);
   cudaEventDestroy(h2d_end);
   cudaEventDestroy(d2h_start);
   cudaEventDestroy(d2h_end);
+  for (int i = 0; i < NUM_STREAMS; i++) {
+    cudaEventDestroy(stream_kernel_starts[i]);
+    cudaEventDestroy(stream_kernel_ends[i]);
+  }
   cudaFree(d_packets);
   cudaFree(d_pubkeys);
   cudaFree(d_results);

@@ -1,9 +1,12 @@
 #include <cuda_runtime.h>
 
+#include <array>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -17,6 +20,11 @@ constexpr uint32_t CURVE_A = 2u;
 constexpr uint32_t CURVE_B = 3u;
 constexpr uint32_t GEN_X = 3u;
 constexpr uint32_t GEN_Y = 65515u;
+constexpr int RS_N = 70;
+constexpr int RS_K = 43;
+constexpr int RS_PARITY = RS_N - RS_K;
+constexpr int RS_DATA_BYTES_PER_PACKET = RS_K;
+constexpr uint32_t TIMESTAMP_WINDOW = 500000u;
 
 struct EcPoint {
   uint32_t x;
@@ -353,11 +361,15 @@ __host__ __device__ bool verify_one(const ADSB_Packet& packet, const SignerPubli
 
 __global__ void verify_kernel(const ADSB_Packet* packets, const SignerPublicKey* pubkeys,
                               const EcPoint Ppub1, const EcPoint Ppub2, const EcPoint P,
-                              int* results, int n) {
+                              int* results, int n, int signer_count) {
   const int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid >= n) return;
 
   const ADSB_Packet pkt = packets[tid];
+  if (pkt.signer_index >= static_cast<uint32_t>(signer_count)) {
+    results[tid] = 0;
+    return;
+  }
   const SignerPublicKey pub = pubkeys[pkt.signer_index];
   results[tid] = verify_one(pkt, pub, Ppub1, Ppub2, P) ? 1 : 0;
 }
@@ -394,6 +406,191 @@ bool batch_verify_cpu(const ADSB_Packet* packets, const SignerPublicKey* pubkeys
   return point_equal(left_sum, right_sum);
 }
 
+struct RsContext {
+  uint8_t exp_table[512];
+  uint8_t log_table[256];
+  std::array<std::array<uint8_t, RS_K>, RS_PARITY> parity_matrix{};
+};
+
+inline uint8_t gf_add(uint8_t a, uint8_t b) {
+  return static_cast<uint8_t>(a ^ b);
+}
+
+uint8_t gf_mul(const RsContext& ctx, uint8_t a, uint8_t b) {
+  if (a == 0 || b == 0) return 0;
+  const int idx = static_cast<int>(ctx.log_table[a]) + static_cast<int>(ctx.log_table[b]);
+  return ctx.exp_table[idx];
+}
+
+uint8_t gf_inv(const RsContext& ctx, uint8_t a) {
+  if (a == 0) return 0;
+  return ctx.exp_table[255 - ctx.log_table[a]];
+}
+
+void init_rs_tables(RsContext& ctx) {
+  uint16_t x = 1;
+  for (int i = 0; i < 255; i++) {
+    ctx.exp_table[i] = static_cast<uint8_t>(x);
+    ctx.log_table[static_cast<uint8_t>(x)] = static_cast<uint8_t>(i);
+    x <<= 1;
+    if (x & 0x100u) x ^= 0x11du;
+  }
+  for (int i = 255; i < 512; i++) ctx.exp_table[i] = ctx.exp_table[i - 255];
+  ctx.log_table[0] = 0;
+}
+
+bool invert_matrix_gf(const RsContext& ctx,
+                      const std::array<std::array<uint8_t, RS_K>, RS_K>& in,
+                      std::array<std::array<uint8_t, RS_K>, RS_K>& out) {
+  std::array<std::array<uint8_t, RS_K * 2>, RS_K> aug{};
+  for (int r = 0; r < RS_K; r++) {
+    for (int c = 0; c < RS_K; c++) aug[r][c] = in[r][c];
+    for (int c = 0; c < RS_K; c++) aug[r][RS_K + c] = (r == c) ? 1u : 0u;
+  }
+
+  for (int col = 0; col < RS_K; col++) {
+    int pivot = col;
+    while (pivot < RS_K && aug[pivot][col] == 0) pivot++;
+    if (pivot == RS_K) return false;
+    if (pivot != col) std::swap(aug[pivot], aug[col]);
+
+    const uint8_t inv_pivot = gf_inv(ctx, aug[col][col]);
+    for (int c = 0; c < RS_K * 2; c++) aug[col][c] = gf_mul(ctx, aug[col][c], inv_pivot);
+
+    for (int r = 0; r < RS_K; r++) {
+      if (r == col) continue;
+      const uint8_t factor = aug[r][col];
+      if (factor == 0) continue;
+      for (int c = 0; c < RS_K * 2; c++) {
+        aug[r][c] = gf_add(aug[r][c], gf_mul(ctx, factor, aug[col][c]));
+      }
+    }
+  }
+
+  for (int r = 0; r < RS_K; r++) {
+    for (int c = 0; c < RS_K; c++) out[r][c] = aug[r][RS_K + c];
+  }
+  return true;
+}
+
+void init_rs_context(RsContext& ctx) {
+  init_rs_tables(ctx);
+
+  std::array<std::array<uint8_t, RS_K>, RS_K> vand_left{};
+  for (int i = 0; i < RS_K; i++) {
+    const uint8_t x = ctx.exp_table[i];
+    uint8_t pow = 1;
+    for (int j = 0; j < RS_K; j++) {
+      vand_left[i][j] = pow;
+      pow = gf_mul(ctx, pow, x);
+    }
+  }
+
+  std::array<std::array<uint8_t, RS_K>, RS_K> inv_left{};
+  if (!invert_matrix_gf(ctx, vand_left, inv_left)) {
+    std::cerr << "RS matrix initialization failed\n";
+    std::exit(1);
+  }
+
+  for (int r = 0; r < RS_PARITY; r++) {
+    const uint8_t x = ctx.exp_table[RS_K + r];
+    uint8_t vand_row[RS_K];
+    uint8_t pow = 1;
+    for (int j = 0; j < RS_K; j++) {
+      vand_row[j] = pow;
+      pow = gf_mul(ctx, pow, x);
+    }
+
+    for (int c = 0; c < RS_K; c++) {
+      uint8_t acc = 0;
+      for (int t = 0; t < RS_K; t++) {
+        acc = gf_add(acc, gf_mul(ctx, vand_row[t], inv_left[t][c]));
+      }
+      ctx.parity_matrix[r][c] = acc;
+    }
+  }
+}
+
+void serialize_packet_to_rs_data(const ADSB_Packet& pkt, std::array<uint8_t, RS_K>& data) {
+  for (int i = 0; i < RS_K; i++) data[i] = 0;
+  for (int i = 0; i < static_cast<int>(ADSB_MESSAGE_BYTES); i++) data[i] = pkt.payload[i];
+  write_u32_be(&data[14], pkt.timestamp);
+  write_u32_be(&data[18], pkt.signer_index);
+  write_u32_be(&data[22], pkt.alpha);
+}
+
+void deserialize_rs_data_to_packet(const std::array<uint8_t, RS_K>& data, ADSB_Packet& pkt) {
+  for (int i = 0; i < static_cast<int>(ADSB_MESSAGE_BYTES); i++) pkt.payload[i] = data[i];
+  pkt.timestamp = (static_cast<uint32_t>(data[14]) << 24) | (static_cast<uint32_t>(data[15]) << 16) |
+                  (static_cast<uint32_t>(data[16]) << 8) | static_cast<uint32_t>(data[17]);
+  pkt.signer_index = (static_cast<uint32_t>(data[18]) << 24) | (static_cast<uint32_t>(data[19]) << 16) |
+                     (static_cast<uint32_t>(data[20]) << 8) | static_cast<uint32_t>(data[21]);
+  pkt.alpha = (static_cast<uint32_t>(data[22]) << 24) | (static_cast<uint32_t>(data[23]) << 16) |
+              (static_cast<uint32_t>(data[24]) << 8) | static_cast<uint32_t>(data[25]);
+}
+
+void rs_encode_systematic(const RsContext& ctx, const std::array<uint8_t, RS_K>& data,
+                          std::array<uint8_t, RS_N>& codeword) {
+  for (int i = 0; i < RS_K; i++) codeword[i] = data[i];
+  for (int r = 0; r < RS_PARITY; r++) {
+    uint8_t acc = 0;
+    for (int c = 0; c < RS_K; c++) {
+      acc = gf_add(acc, gf_mul(ctx, ctx.parity_matrix[r][c], data[c]));
+    }
+    codeword[RS_K + r] = acc;
+  }
+}
+
+bool rs_decode_erasures(const RsContext& ctx, std::array<uint8_t, RS_N>& rx,
+                        const std::array<uint8_t, RS_N>& erased) {
+  int received_positions[RS_K];
+  int count = 0;
+  for (int i = 0; i < RS_N && count < RS_K; i++) {
+    if (!erased[i]) received_positions[count++] = i;
+  }
+  if (count < RS_K) return false;
+
+  std::array<std::array<uint8_t, RS_K>, RS_K> mat{};
+  std::array<uint8_t, RS_K> rhs{};
+  for (int row = 0; row < RS_K; row++) {
+    const int pos = received_positions[row];
+    if (pos < RS_K) {
+      for (int col = 0; col < RS_K; col++) mat[row][col] = (col == pos) ? 1u : 0u;
+    } else {
+      for (int col = 0; col < RS_K; col++) mat[row][col] = ctx.parity_matrix[pos - RS_K][col];
+    }
+    rhs[row] = rx[pos];
+  }
+
+  std::array<std::array<uint8_t, RS_K>, RS_K> inv{};
+  if (!invert_matrix_gf(ctx, mat, inv)) return false;
+
+  std::array<uint8_t, RS_K> msg{};
+  for (int r = 0; r < RS_K; r++) {
+    uint8_t acc = 0;
+    for (int c = 0; c < RS_K; c++) {
+      acc = gf_add(acc, gf_mul(ctx, inv[r][c], rhs[c]));
+    }
+    msg[r] = acc;
+  }
+
+  std::array<uint8_t, RS_N> rebuilt{};
+  rs_encode_systematic(ctx, msg, rebuilt);
+  rx = rebuilt;
+  return true;
+}
+
+bool timestamp_fresh(uint32_t ts, uint32_t& last_seen) {
+  if (last_seen == 0) {
+    last_seen = ts;
+    return true;
+  }
+  if (ts <= last_seen) return false;
+  if (ts - last_seen > TIMESTAMP_WINDOW) return false;
+  last_seen = ts;
+  return true;
+}
+
 void check_cuda(cudaError_t code, const char* expr) {
   if (code != cudaSuccess) {
     std::cerr << "CUDA error at " << expr << ": " << cudaGetErrorString(code) << '\n';
@@ -412,6 +609,8 @@ uint32_t next_nonzero_lcg(uint32_t& s) {
 int main() {
   constexpr int N = 1 << 16;
   constexpr int SIGNER_COUNT = 64;
+  constexpr int RS_SIM_PACKETS = 2048;
+  constexpr int RS_ERASURES_PER_PACKET = 8;
 
   const size_t packet_bytes = sizeof(ADSB_Packet) * N;
   const size_t result_bytes = sizeof(int) * N;
@@ -426,6 +625,7 @@ int main() {
   std::vector<SignerPrivateState> signer_priv(SIGNER_COUNT);
   std::vector<SignerPublicKey> signer_pub(SIGNER_COUNT);
   std::vector<ADSB_Packet> h_packets(N);
+  std::vector<ADSB_Packet> h_verified_packets(N);
   std::vector<int> h_cpu_results(N, 0);
   std::vector<int> h_gpu_results(N, 0);
 
@@ -504,62 +704,190 @@ int main() {
   const auto sign_end = std::chrono::high_resolution_clock::now();
   const auto sign_ms = std::chrono::duration<double, std::milli>(sign_end - sign_start).count();
 
+  // Simulate packet-loss-tolerant RS coding over a subset of packets.
+  RsContext rs_ctx{};
+  init_rs_context(rs_ctx);
+  int rs_recovered = 0;
+  int rs_decode_failures = 0;
+  for (int i = 0; i < N; i++) h_verified_packets[i] = h_packets[i];
+
+  for (int i = 0; i < RS_SIM_PACKETS && i < N; i++) {
+    std::array<uint8_t, RS_K> data{};
+    std::array<uint8_t, RS_N> codeword{};
+    std::array<uint8_t, RS_N> received{};
+    std::array<uint8_t, RS_N> erased{};
+
+    serialize_packet_to_rs_data(h_packets[i], data);
+    rs_encode_systematic(rs_ctx, data, codeword);
+    received = codeword;
+    for (int j = 0; j < RS_N; j++) erased[j] = 0;
+
+    for (int e = 0; e < RS_ERASURES_PER_PACKET; e++) {
+      const int pos = (i * 13 + e * 7) % RS_N;
+      received[pos] = 0;
+      erased[pos] = 1;
+    }
+
+    if (!rs_decode_erasures(rs_ctx, received, erased)) {
+      rs_decode_failures++;
+      continue;
+    }
+
+    std::array<uint8_t, RS_K> recovered{};
+    for (int j = 0; j < RS_K; j++) recovered[j] = received[j];
+    ADSB_Packet pkt = h_verified_packets[i];
+    deserialize_rs_data_to_packet(recovered, pkt);
+    if (pkt.signer_index >= static_cast<uint32_t>(SIGNER_COUNT)) {
+      rs_decode_failures++;
+      continue;
+    }
+    h_verified_packets[i] = pkt;
+    rs_recovered++;
+  }
+
+  // Inject replay packets for explicit timestamp freshness testing.
+  int replay_injected = 0;
+  for (int i = SIGNER_COUNT * 2; i < N && replay_injected < 120; i += 533) {
+    h_verified_packets[i].timestamp = h_verified_packets[i - SIGNER_COUNT].timestamp;
+    replay_injected++;
+  }
+
   ADSB_Packet* d_packets = nullptr;
   SignerPublicKey* d_pubkeys = nullptr;
   int* d_results = nullptr;
 
+  std::vector<uint32_t> last_seen_ts(SIGNER_COUNT, 0u);
+  int replay_reject_count = 0;
+  std::vector<int> filtered_valid_indices;
+  filtered_valid_indices.reserve(valid_indices.size());
+  std::vector<int> filtered_all_indices;
+  filtered_all_indices.reserve(all_indices.size());
+
   const auto cpu_start = std::chrono::high_resolution_clock::now();
-  verify_cpu(h_packets.data(), signer_pub.data(), Ppub1, Ppub2, P, h_cpu_results.data(), N);
+  for (int i = 0; i < N; i++) {
+    const ADSB_Packet& pkt = h_verified_packets[i];
+    if (pkt.signer_index >= static_cast<uint32_t>(SIGNER_COUNT)) {
+      h_cpu_results[i] = 0;
+      continue;
+    }
+
+    uint32_t& last_ts = last_seen_ts[pkt.signer_index];
+    if (!timestamp_fresh(pkt.timestamp, last_ts)) {
+      h_cpu_results[i] = 0;
+      replay_reject_count++;
+      filtered_all_indices.push_back(i);
+      continue;
+    }
+
+    const SignerPublicKey& pub = signer_pub[pkt.signer_index];
+    h_cpu_results[i] = verify_one(pkt, pub, Ppub1, Ppub2, P) ? 1 : 0;
+    filtered_all_indices.push_back(i);
+    if (h_cpu_results[i] == 1) filtered_valid_indices.push_back(i);
+  }
   const auto cpu_end = std::chrono::high_resolution_clock::now();
   const auto cpu_ms = std::chrono::duration<double, std::milli>(cpu_end - cpu_start).count();
 
-  const bool batch_valid_ok = batch_verify_cpu(h_packets.data(), signer_pub.data(), Ppub1, Ppub2, P, valid_indices);
-  const bool batch_all_ok = batch_verify_cpu(h_packets.data(), signer_pub.data(), Ppub1, Ppub2, P, all_indices);
+  const bool batch_valid_ok = batch_verify_cpu(h_verified_packets.data(), signer_pub.data(), Ppub1, Ppub2, P, filtered_valid_indices);
+  const bool batch_all_ok = batch_verify_cpu(h_verified_packets.data(), signer_pub.data(), Ppub1, Ppub2, P, filtered_all_indices);
 
   check_cuda(cudaMalloc(&d_packets, packet_bytes), "cudaMalloc(d_packets)");
   check_cuda(cudaMalloc(&d_pubkeys, pubkey_bytes), "cudaMalloc(d_pubkeys)");
   check_cuda(cudaMalloc(&d_results, result_bytes), "cudaMalloc(d_results)");
 
+  constexpr int BATCH_SIZE = 8192;
+  constexpr int NUM_STREAMS = 3;
+  cudaStream_t streams[NUM_STREAMS];
+  for (int i = 0; i < NUM_STREAMS; i++) {
+    check_cuda(cudaStreamCreate(&streams[i]), "cudaStreamCreate");
+  }
+
   cudaEvent_t kernel_start, kernel_end, h2d_start, h2d_end, d2h_start, d2h_end;
+  cudaEvent_t stream_kernel_starts[NUM_STREAMS], stream_kernel_ends[NUM_STREAMS];
   check_cuda(cudaEventCreate(&kernel_start), "cudaEventCreate(kernel_start)");
   check_cuda(cudaEventCreate(&kernel_end), "cudaEventCreate(kernel_end)");
   check_cuda(cudaEventCreate(&h2d_start), "cudaEventCreate(h2d_start)");
   check_cuda(cudaEventCreate(&h2d_end), "cudaEventCreate(h2d_end)");
   check_cuda(cudaEventCreate(&d2h_start), "cudaEventCreate(d2h_start)");
   check_cuda(cudaEventCreate(&d2h_end), "cudaEventCreate(d2h_end)");
+  for (int i = 0; i < NUM_STREAMS; i++) {
+    check_cuda(cudaEventCreate(&stream_kernel_starts[i]), "cudaEventCreate(stream_kernel_starts[i])");
+    check_cuda(cudaEventCreate(&stream_kernel_ends[i]), "cudaEventCreate(stream_kernel_ends[i])");
+  }
 
   const auto gpu_total_start = std::chrono::high_resolution_clock::now();
   check_cuda(cudaEventRecord(h2d_start), "cudaEventRecord(h2d_start)");
-  check_cuda(cudaMemcpy(d_packets, h_packets.data(), packet_bytes, cudaMemcpyHostToDevice), "cudaMemcpy packets H2D");
-  check_cuda(cudaMemcpy(d_pubkeys, signer_pub.data(), pubkey_bytes, cudaMemcpyHostToDevice), "cudaMemcpy pubkeys H2D");
-  check_cuda(cudaEventRecord(h2d_end), "cudaEventRecord(h2d_end)");
+  check_cuda(cudaMemcpyAsync(d_pubkeys, signer_pub.data(), pubkey_bytes, cudaMemcpyHostToDevice, streams[0]),
+             "cudaMemcpyAsync pubkeys H2D");
 
-  const int blocks = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-  verify_kernel<<<blocks, THREADS_PER_BLOCK>>>(d_packets, d_pubkeys, Ppub1, Ppub2, P, d_results, N);
-  check_cuda(cudaGetLastError(), "verify_kernel warmup launch");
-  check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize warmup");
+  constexpr int PROFILE_BATCHES[] = {2, 4, 6};
+  constexpr int NUM_PROFILE_BATCHES = sizeof(PROFILE_BATCHES) / sizeof(PROFILE_BATCHES[0]);
+  float profile_times_ms[NUM_PROFILE_BATCHES] = {0.0f};
 
-  check_cuda(cudaEventRecord(kernel_start), "cudaEventRecord(kernel_start)");
-  for (int run = 0; run < GPU_PROFILE_RUNS; run++) {
-    verify_kernel<<<blocks, THREADS_PER_BLOCK>>>(d_packets, d_pubkeys, Ppub1, Ppub2, P, d_results, N);
+  int batch_idx = 0;
+  for (int batch_start = 0; batch_start < N; batch_start += BATCH_SIZE, batch_idx++) {
+    const int batch_end = (batch_start + BATCH_SIZE < N) ? (batch_start + BATCH_SIZE) : N;
+    const int batch_size = batch_end - batch_start;
+    const int batch_blocks = (batch_size + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    const int stream_idx = batch_idx % NUM_STREAMS;
+    cudaStream_t current_stream = streams[stream_idx];
+
+    check_cuda(cudaMemcpyAsync(d_packets + batch_start, h_verified_packets.data() + batch_start,
+                               sizeof(ADSB_Packet) * batch_size, cudaMemcpyHostToDevice, current_stream),
+               "cudaMemcpyAsync packets H2D");
+
+    verify_kernel<<<batch_blocks, THREADS_PER_BLOCK, 0, current_stream>>>(
+        d_packets + batch_start, d_pubkeys, Ppub1, Ppub2, P, d_results + batch_start, batch_size, SIGNER_COUNT);
+    check_cuda(cudaGetLastError(), "verify_kernel warmup launch");
+
+    bool is_profile_batch = false;
+    for (int i = 0; i < NUM_PROFILE_BATCHES; i++) {
+      if (batch_idx == PROFILE_BATCHES[i]) {
+        is_profile_batch = true;
+        break;
+      }
+    }
+    if (is_profile_batch) {
+      check_cuda(cudaEventRecord(stream_kernel_starts[stream_idx], current_stream), "cudaEventRecord(kernel_start)");
+      for (int run = 0; run < GPU_PROFILE_RUNS; run++) {
+        verify_kernel<<<batch_blocks, THREADS_PER_BLOCK, 0, current_stream>>>(
+            d_packets + batch_start, d_pubkeys, Ppub1, Ppub2, P, d_results + batch_start, batch_size, SIGNER_COUNT);
+      }
+      check_cuda(cudaEventRecord(stream_kernel_ends[stream_idx], current_stream), "cudaEventRecord(kernel_end)");
+      check_cuda(cudaGetLastError(), "verify_kernel profile launch");
+    }
+
+    verify_kernel<<<batch_blocks, THREADS_PER_BLOCK, 0, current_stream>>>(
+        d_packets + batch_start, d_pubkeys, Ppub1, Ppub2, P, d_results + batch_start, batch_size, SIGNER_COUNT);
+    check_cuda(cudaGetLastError(), "verify_kernel final launch");
+
+    check_cuda(cudaMemcpyAsync(h_gpu_results.data() + batch_start, d_results + batch_start, sizeof(int) * batch_size,
+                               cudaMemcpyDeviceToHost, current_stream),
+               "cudaMemcpyAsync results D2H");
   }
-  verify_kernel<<<blocks, THREADS_PER_BLOCK>>>(d_packets, d_pubkeys, Ppub1, Ppub2, P, d_results, N);
-  check_cuda(cudaEventRecord(kernel_end), "cudaEventRecord(kernel_end)");
-  check_cuda(cudaGetLastError(), "verify_kernel launch");
-  check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
 
+  check_cuda(cudaEventRecord(h2d_end), "cudaEventRecord(h2d_end)");
   check_cuda(cudaEventRecord(d2h_start), "cudaEventRecord(d2h_start)");
-  check_cuda(cudaMemcpy(h_gpu_results.data(), d_results, result_bytes, cudaMemcpyDeviceToHost), "cudaMemcpy results D2H");
+  for (int i = 0; i < NUM_STREAMS; i++) {
+    check_cuda(cudaStreamSynchronize(streams[i]), "cudaStreamSynchronize");
+  }
   check_cuda(cudaEventRecord(d2h_end), "cudaEventRecord(d2h_end)");
   check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize post D2H");
   const auto gpu_total_end = std::chrono::high_resolution_clock::now();
 
   float gpu_kernel_ms = 0.0f, gpu_h2d_ms = 0.0f, gpu_d2h_ms = 0.0f;
-  check_cuda(cudaEventElapsedTime(&gpu_kernel_ms, kernel_start, kernel_end), "cudaEventElapsedTime");
+  for (int i = 0; i < NUM_PROFILE_BATCHES; i++) {
+    float elapsed = 0.0f;
+    check_cuda(cudaEventElapsedTime(&elapsed, stream_kernel_starts[PROFILE_BATCHES[i] % NUM_STREAMS],
+                                    stream_kernel_ends[PROFILE_BATCHES[i] % NUM_STREAMS]),
+               "cudaEventElapsedTime profile");
+    profile_times_ms[i] = elapsed;
+  }
+  std::sort(profile_times_ms, profile_times_ms + NUM_PROFILE_BATCHES);
+  gpu_kernel_ms = profile_times_ms[NUM_PROFILE_BATCHES / 2];
   check_cuda(cudaEventElapsedTime(&gpu_h2d_ms, h2d_start, h2d_end), "cudaEventElapsedTime h2d");
   check_cuda(cudaEventElapsedTime(&gpu_d2h_ms, d2h_start, d2h_end), "cudaEventElapsedTime d2h");
   const auto gpu_total_ms = std::chrono::duration<double, std::milli>(gpu_total_end - gpu_total_start).count();
-  const double gpu_kernel_avg_ms = static_cast<double>(gpu_kernel_ms) / static_cast<double>(GPU_PROFILE_RUNS + 1);
+  const double gpu_kernel_avg_ms = static_cast<double>(gpu_kernel_ms) / static_cast<double>(GPU_PROFILE_RUNS);
 
   int valid_count = 0;
   for (int i = 0; i < N; i++) valid_count += h_gpu_results[i];
@@ -581,9 +909,12 @@ int main() {
   std::cout << "Packets: " << N << ", Signers: " << SIGNER_COUNT << '\n';
   std::cout << "Keygen time (ms): " << keygen_ms << '\n';
   std::cout << "Sign time (ms): " << sign_ms << '\n';
+  std::cout << "RS simulated packets: " << RS_SIM_PACKETS << ", erasures/packet: " << RS_ERASURES_PER_PACKET << '\n';
+  std::cout << "RS recoveries: " << rs_recovered << ", RS decode failures: " << rs_decode_failures << '\n';
+  std::cout << "Replay injected: " << replay_injected << ", replay rejects (CPU freshness filter): " << replay_reject_count << '\n';
   std::cout << "CPU verify time (ms): " << cpu_ms << '\n';
   std::cout << "GPU H2D time (ms): " << gpu_h2d_ms << '\n';
-  std::cout << "GPU kernel total time over " << (GPU_PROFILE_RUNS + 1) << " runs (ms): " << gpu_kernel_ms << '\n';
+  std::cout << "GPU kernel total time over " << GPU_PROFILE_RUNS << " runs (ms): " << gpu_kernel_ms << '\n';
   std::cout << "GPU kernel avg time (ms): " << gpu_kernel_avg_ms << '\n';
   std::cout << "GPU D2H time (ms): " << gpu_d2h_ms << '\n';
   std::cout << "GPU end-to-end time (ms): " << gpu_total_ms << '\n';
@@ -600,12 +931,19 @@ int main() {
   for (int i = 0; i < 8; i++) std::cout << h_gpu_results[i] << ' ';
   std::cout << '\n';
 
+  for (int i = 0; i < NUM_STREAMS; i++) {
+    cudaStreamDestroy(streams[i]);
+  }
   cudaEventDestroy(kernel_start);
   cudaEventDestroy(kernel_end);
   cudaEventDestroy(h2d_start);
   cudaEventDestroy(h2d_end);
   cudaEventDestroy(d2h_start);
   cudaEventDestroy(d2h_end);
+  for (int i = 0; i < NUM_STREAMS; i++) {
+    cudaEventDestroy(stream_kernel_starts[i]);
+    cudaEventDestroy(stream_kernel_ends[i]);
+  }
   cudaFree(d_packets);
   cudaFree(d_pubkeys);
   cudaFree(d_results);
